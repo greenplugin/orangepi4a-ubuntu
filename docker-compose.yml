@@ -1,0 +1,48 @@
+services:
+  builder-arm:
+    build:
+      context: .
+      dockerfile: Dockerfile.arm
+    platform: linux/arm64
+    privileged: true
+    volumes:
+      # Source repository (read-only)
+      - ../:/repo:ro
+      # Build script
+      - ./build-arm.sh:/build/build-arm.sh:ro
+      # Persistent caches (local bind mounts)
+      - ./.cache/kernel:/build/kernel
+      - ./.cache/uboot:/build/uboot
+      - ./.cache/rootfs:/build/rootfs-cache
+      - ./.cache/debootstrap:/build/debootstrap-cache
+      - ./.cache/ccache:/root/.ccache
+    environment:
+      - CCACHE_DIR=/root/.ccache
+      - BOARD=orangepi4a
+      - RELEASE=noble
+    command: bash /build/build-arm.sh
+
+  builder-pack:
+    build:
+      context: .
+      dockerfile: Dockerfile.pack
+    platform: linux/amd64
+    privileged: true
+    depends_on:
+      builder-arm:
+        condition: service_completed_successfully
+    volumes:
+      # Source repository (read-only)
+      - ../:/repo:ro
+      # Build script
+      - ./build-pack.sh:/build/build-pack.sh:ro
+      # Shared artifacts from ARM stage (local bind mounts)
+      - ./.cache/kernel:/build/kernel:ro
+      - ./.cache/uboot:/build/uboot
+      - ./.cache/rootfs:/build/rootfs-cache
+      # Output directory
+      - ./output:/build/output
+    environment:
+      - BOARD=orangepi4a
+      - RELEASE=noble
+    command: bash /build/build-pack.sh

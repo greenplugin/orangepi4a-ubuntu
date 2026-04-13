@@ -1,0 +1,12 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    parted dosfstools e2fsprogs kpartx \
+    u-boot-tools device-tree-compiler cpp \
+    rsync xz-utils busybox fdisk gdisk \
+    uuid-runtime ca-certificates util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
