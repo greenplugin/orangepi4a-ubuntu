@@ -209,6 +209,16 @@ sudo migrate-to-nvme --reflash-spi
 
 See [NVME-BOOT-ISSUE.md](NVME-BOOT-ISSUE.md) for details on the NVMe U-Boot fix.
 
+#### Install a desktop environment (optional)
+
+The base image is headless by design. To add GNOME / KDE / XFCE or a lightweight Wayland compositor
+after the first boot, use the bundled `install-desktop` helper — see [DESKTOP.md](DESKTOP.md) for
+flavors, GPU acceleration notes and black-screen troubleshooting.
+
+```bash
+sudo install-desktop gnome   # or: kde | xfce | labwc | sway | weston | kodi
+```
+
 #### Adding GPU/VPU/NPU support
 For headless compute, manually install vendor packages after boot:
 ```bash

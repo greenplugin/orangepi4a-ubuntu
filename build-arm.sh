@@ -311,6 +311,41 @@ deb http://ports.ubuntu.com/ ${RELEASE}-updates main restricted universe multive
 deb http://ports.ubuntu.com/ ${RELEASE}-security main restricted universe multiverse
 EOF
 
+    # Protect vendor kernel: prevent installation of generic Ubuntu kernel
+    # packages and DKMS modules that are incompatible with the vendor 5.15
+    # kernel and cause kernel panic (apply_relocate_add crash on module load).
+    # Users can still install desktop environments (ubuntu-desktop, xfce4, etc.)
+    # safely — only the kernel-related dependencies are blocked.
+    mkdir -p "${rootfs}/etc/apt/preferences.d"
+    cat > "${rootfs}/etc/apt/preferences.d/99-vendor-kernel-protect.pref" <<'APTPIN'
+# Prevent installation of Ubuntu generic kernel packages.
+# This board uses a vendor (Allwinner/OrangePi) kernel — generic kernel
+# images and modules are incompatible and will cause kernel panic.
+
+# Block all generic/virtual/lowlatency kernel images
+Package: linux-image-generic linux-image-generic-hwe-* linux-image-virtual linux-image-lowlatency linux-image-unsigned-*
+Pin: release *
+Pin-Priority: -1
+
+# Block generic kernel modules (incompatible .ko files crash the vendor kernel)
+Package: linux-modules-generic linux-modules-generic-hwe-* linux-modules-extra-*
+Pin: release *
+Pin-Priority: -1
+
+# Block kernel headers (prevent DKMS from building modules for wrong kernel)
+Package: linux-headers-generic linux-headers-generic-hwe-* linux-headers-virtual linux-headers-lowlatency
+Pin: release *
+Pin-Priority: -1
+
+# Note: DKMS is NOT blocked — users may need it to build kernel modules
+# (e.g. wireguard, v4l2loopback) once vendor kernel headers are available.
+
+# Block linux-generic and linux-virtual meta-packages
+Package: linux-generic linux-generic-hwe-* linux-virtual linux-lowlatency
+Pin: release *
+Pin-Priority: -1
+APTPIN
+
     # Locale
     chroot "${rootfs}" locale-gen en_US.UTF-8
     echo "LANG=en_US.UTF-8" > "${rootfs}/etc/default/locale"
@@ -453,6 +488,95 @@ HWINIT
     # Install NVMe migration script
     cp "${REPO}/ubuntu/scripts/migrate-to-nvme.sh" "${rootfs}/usr/local/bin/migrate-to-nvme"
     chmod +x "${rootfs}/usr/local/bin/migrate-to-nvme"
+
+    # Xorg modesetting config for sunxi-drm + Panfrost (Allwinner T527).
+    #
+    # Scanout path: /dev/dri/card0 (sunxi-drm) — linear XR24 framebuffer.
+    # GL accel:     /dev/dri/card1 (Panfrost, Mali-G57) via glamor + DRI3.
+    #
+    # Xorg auto-detects Panfrost as the GPU provider and enables glamor on it
+    # (verified: Xorg.log → "glamor X acceleration enabled on Mali-G57 (Panfrost)",
+    # glxinfo → "OpenGL renderer: Mali-G57 (Panfrost)", glmark2-es2 → ~55 FPS).
+    #
+    # Without this file Xorg tries "fbdev"/framebuffer mode on sunxi-drm and
+    # fails with "Cannot run in framebuffer mode" — SDDM/GDM X11 greeter die.
+    mkdir -p "${rootfs}/etc/X11/xorg.conf.d"
+    cat > "${rootfs}/etc/X11/xorg.conf.d/10-modesetting.conf" <<'XORGCONF'
+Section "Device"
+    Identifier "sunxi-drm"
+    Driver     "modesetting"
+    Option     "kmsdev" "/dev/dri/card0"
+    # DRI3 enables zero-copy PRIME between Panfrost (render) and sunxi-drm
+    # (scanout); glamor is picked up automatically on the Panfrost device.
+    Option     "DRI" "3"
+EndSection
+XORGCONF
+
+    # Allow X server to be started from any context (SSH, display managers)
+    mkdir -p "${rootfs}/etc/X11"
+    cat > "${rootfs}/etc/X11/Xwrapper.config" <<'XWRAP'
+allowed_users=anybody
+needs_root_rights=yes
+XWRAP
+
+    # Install desktop environment installer (user runs manually on the board)
+    cp "${REPO}/ubuntu/user/install-desktop.sh" "${rootfs}/usr/local/bin/install-desktop"
+    chmod +x "${rootfs}/usr/local/bin/install-desktop"
+
+    # Install optional vendor CedarX (T527 VPU) userspace installer.
+    # Opt-in only — user must run `sudo install-vpu` explicitly to enable
+    # hardware video decode for Kodi. Base image stays blob-free.
+    cp "${REPO}/ubuntu/user/install-vpu.sh" "${rootfs}/usr/local/bin/install-vpu"
+    chmod +x "${rootfs}/usr/local/bin/install-vpu"
+
+    # HDMI pre-warm service — vendor sunxi-drm on T527 initialises the HDMI
+    # connector lazily; on cold boot /sys/class/drm/card0-HDMI-A-1/modes is
+    # empty until someone does `echo detect > .../status`. Without this the
+    # display manager starts before EDID is read and Xorg/GDM end up with no
+    # modes → blank screen. This oneshot runs before any display-manager.
+    cat > "${rootfs}/etc/systemd/system/orangepi4a-wait-hdmi.service" <<'HDMIWAIT'
+[Unit]
+Description=Orange Pi 4A HDMI connector pre-warm (force EDID read before DM)
+DefaultDependencies=no
+After=systemd-udev-settle.service
+Before=display-manager.service gdm3.service sddm.service lightdm.service graphical.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+  for i in $(seq 1 30); do \
+    for s in /sys/class/drm/card*-HDMI*/status; do \
+      [ -e "$s" ] && echo detect > "$s" 2>/dev/null || true; \
+    done; \
+    modes=$(cat /sys/class/drm/card*-HDMI*/modes 2>/dev/null | head -1); \
+    [ -n "$modes" ] && exit 0; \
+    sleep 0.5; \
+  done; \
+  exit 0'
+
+[Install]
+WantedBy=graphical.target
+HDMIWAIT
+    chroot "${rootfs}" systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
+
+    # Extra DRM/input udev rules — vendor kernel 5.15 without TMPFS_POSIX_ACL
+    # can't apply logind ACLs on devtmpfs (seen as "Failed to apply ACL:
+    # Operation not supported" during boot). Give group-based access as a
+    # fallback, so GNOME/KDE/weston can open DRM/sound/input without relying
+    # on broken ACLs.
+    cat > "${rootfs}/etc/udev/rules.d/99-orangepi4a-drm.rules" <<'DRMRULES'
+# Orange Pi 4A — group-based access (fallback for missing devtmpfs ACL).
+KERNEL=="card[0-9]*",    SUBSYSTEM=="drm",   MODE="0660", GROUP="video",  TAG+="uaccess"
+KERNEL=="renderD*",      SUBSYSTEM=="drm",   MODE="0660", GROUP="render", TAG+="uaccess"
+KERNEL=="controlC[0-9]*",SUBSYSTEM=="sound", MODE="0660", GROUP="audio",  TAG+="uaccess"
+KERNEL=="pcmC*",         SUBSYSTEM=="sound", MODE="0660", GROUP="audio",  TAG+="uaccess"
+KERNEL=="event[0-9]*",   SUBSYSTEM=="input", MODE="0660", GROUP="input",  TAG+="uaccess"
+
+# Force HDMI EDID re-read on connector add — covers hot-plug and cold boot.
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", \
+    RUN+="/bin/sh -c 'for c in /sys/class/drm/%k-HDMI*/status; do [ -e \"$c\" ] && echo detect > \"$c\"; done'"
+DRMRULES
 
     # Prepare directory for bootloader files (populated by pack stage)
     mkdir -p "${rootfs}/usr/lib/linux-u-boot"
@@ -721,6 +845,63 @@ fdtfile=${DTB_FILE}
 rootdev=/dev/mmcblk0p1
 rootfstype=ext4
 EOF
+
+    # Install kernel headers (needed for DKMS — wireguard, v4l2loopback, etc.)
+    if [[ -n "${kver}" ]]; then
+        log "Installing kernel headers for DKMS support..."
+        local hdr_dst="${rootfs}/usr/src/linux-headers-${kver}"
+        local ksrc="${KERNEL_DIR}/source"
+        mkdir -p "${hdr_dst}"
+
+        # Core files needed by DKMS/module builds
+        cp "${ksrc}/.config" "${hdr_dst}/"
+        cp "${ksrc}/Makefile" "${hdr_dst}/"
+        cp "${ksrc}/Module.symvers" "${hdr_dst}/"
+
+        # Scripts directory (build infrastructure)
+        rsync -a "${ksrc}/scripts/" "${hdr_dst}/scripts/"
+
+        # Kernel headers
+        rsync -a --include='*/' --include='*.h' --exclude='*' \
+            "${ksrc}/include/" "${hdr_dst}/include/"
+
+        # Architecture-specific headers
+        mkdir -p "${hdr_dst}/arch/arm64/include"
+        rsync -a --include='*/' --include='*.h' --exclude='*' \
+            "${ksrc}/arch/arm64/include/" "${hdr_dst}/arch/arm64/include/"
+
+        # Generated headers (autoconf, bounds, asm-offsets)
+        if [[ -d "${ksrc}/include/generated" ]]; then
+            mkdir -p "${hdr_dst}/include/generated"
+            rsync -a "${ksrc}/include/generated/" "${hdr_dst}/include/generated/"
+        fi
+        if [[ -d "${ksrc}/include/config" ]]; then
+            mkdir -p "${hdr_dst}/include/config"
+            rsync -a "${ksrc}/include/config/" "${hdr_dst}/include/config/"
+        fi
+        if [[ -d "${ksrc}/arch/arm64/include/generated" ]]; then
+            mkdir -p "${hdr_dst}/arch/arm64/include/generated"
+            rsync -a "${ksrc}/arch/arm64/include/generated/" \
+                "${hdr_dst}/arch/arm64/include/generated/"
+        fi
+
+        # Kconfig files (needed by some module builds)
+        find "${ksrc}" -name 'Kconfig*' -printf '%P\n' | while read -r f; do
+            mkdir -p "${hdr_dst}/$(dirname "$f")"
+            cp "${ksrc}/${f}" "${hdr_dst}/${f}"
+        done
+
+        # Tools needed for module compilation
+        if [[ -d "${ksrc}/tools/objtool" ]]; then
+            mkdir -p "${hdr_dst}/tools/objtool"
+            cp "${ksrc}/tools/objtool/objtool" "${hdr_dst}/tools/objtool/" 2>/dev/null || true
+        fi
+
+        # Symlink from modules directory to headers (DKMS looks here)
+        ln -sf "/usr/src/linux-headers-${kver}" "${rootfs}/lib/modules/${kver}/build"
+
+        log "Kernel headers installed (~$(du -sh "${hdr_dst}" | cut -f1))"
+    fi
 
     # Generate initrd inside chroot (native arm64, no qemu needed)
     # kver already set above
