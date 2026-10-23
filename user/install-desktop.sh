@@ -458,11 +458,23 @@ install_weston() {
 # DEs could leave a wrong DM active).
 preseed_default_dm() {
     local dm="$1"  # gdm3 | sddm | lightdm
-    echo "shared/default-x-display-manager select $dm" | debconf-set-selections
-    echo "${dm} shared/default-x-display-manager select $dm" | debconf-set-selections
-    if [[ -f /etc/X11/default-display-manager ]]; then
-        echo "/usr/sbin/$dm" > /etc/X11/default-display-manager
+    echo "${dm} shared/default-x-display-manager select ${dm}" | debconf-set-selections
+    mkdir -p /etc/X11
+    echo "/usr/sbin/${dm}" > /etc/X11/default-display-manager
+}
+
+enable_display_manager() {
+    local dm="$1"  # gdm3 | sddm | lightdm
+    mkdir -p /etc/X11 /etc/systemd/system
+    echo "/usr/sbin/${dm}" > /etc/X11/default-display-manager
+    if [[ -e "/lib/systemd/system/${dm}.service" ]]; then
+        ln -sf "/lib/systemd/system/${dm}.service" /etc/systemd/system/display-manager.service
+    elif [[ -e "/usr/lib/systemd/system/${dm}.service" ]]; then
+        ln -sf "/usr/lib/systemd/system/${dm}.service" /etc/systemd/system/display-manager.service
     fi
+    systemctl enable "${dm}.service" 2>/dev/null || true
+    systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
+    systemctl set-default graphical.target 2>/dev/null || true
 }
 
 install_gnome() {
@@ -497,11 +509,10 @@ install_gnome() {
     # -------------------------------------------------------------------------
 
     # Minimal GNOME — avoid ubuntu-desktop to skip LibreOffice/Thunderbird/snapd.
-    # Include Xorg stack and gnome-session-xsession so /usr/share/xsessions/
+    # Include Xorg stack and gnome-session so /usr/share/xsessions/
     # gets gnome.desktop + gnome-xorg.desktop (otherwise there is no X session).
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         gnome-session \
-        gnome-session-xsession \
         gnome-shell \
         gnome-terminal \
         gnome-control-center \
@@ -560,9 +571,7 @@ GDMCONF
     # Ensure user is in render group (Panfrost renderD128 access)
     ensure_user_gpu_groups
 
-    systemctl enable gdm3.service
-    systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
-    systemctl set-default graphical.target
+    enable_display_manager gdm3
 }
 
 install_kde() {
@@ -628,9 +637,7 @@ SDDMAUTO
     ensure_panfrost_env
     ensure_user_gpu_groups
 
-    systemctl enable sddm.service
-    systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
-    systemctl set-default graphical.target
+    enable_display_manager sddm
 }
 
 install_xfce() {
@@ -669,9 +676,7 @@ LDMAUTO
     ensure_panfrost_env
     ensure_user_gpu_groups
 
-    systemctl enable lightdm.service
-    systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
-    systemctl set-default graphical.target
+    enable_display_manager lightdm
 }
 
 # =============================================================================
