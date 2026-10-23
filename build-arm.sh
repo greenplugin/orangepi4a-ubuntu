@@ -340,12 +340,12 @@ Pin: release *
 Pin-Priority: -1
 
 # Block kernel meta-packages
-Package: linux-generic* linux-virtual* linux-lowlatency* linux-raspi* linux-aws* linux-azure* linux-gcp* linux-oracle* linux-kvm*
+Package: linux-generic* linux-virtual* linux-lowlatency*
 Pin: release *
 Pin-Priority: -1
 
-# Block flash-kernel and distro U-Boot packages that overwrite /boot/boot.scr or U-Boot
-Package: flash-kernel u-boot-sunxi u-boot-rpi
+# Block flash-kernel (overwrites /boot/boot.scr on arm64 during kernel/initramfs updates)
+Package: flash-kernel
 Pin: release *
 Pin-Priority: -1
 APTPIN
@@ -522,12 +522,12 @@ Pin: release *
 Pin-Priority: -1
 
 # Block kernel meta-packages
-Package: linux-generic* linux-virtual* linux-lowlatency* linux-raspi* linux-aws* linux-azure* linux-gcp* linux-oracle* linux-kvm*
+Package: linux-generic* linux-virtual* linux-lowlatency*
 Pin: release *
 Pin-Priority: -1
 
-# Block flash-kernel and distro U-Boot packages that overwrite /boot/boot.scr or U-Boot
-Package: flash-kernel u-boot-sunxi u-boot-rpi
+# Block flash-kernel (overwrites /boot/boot.scr on arm64 during kernel/initramfs updates)
+Package: flash-kernel
 Pin: release *
 Pin-Priority: -1
 APTPIN

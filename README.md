@@ -6,7 +6,7 @@
 
 > **⚠️ DISCLAIMER**: This software is provided "as is", without warranty of any kind. Use at your own risk. The authors are not responsible for any damage to hardware or data. Always back up your data before flashing.
 
-> **👇 PROJECT STATUS**: This is a weekend/hobby project. It can serve as a base for your own custom images or simply be used when you need a clean Ubuntu Server or Desktop image for your tasks on Orange Pi 4A. Automated image builds for both **Server** and **Desktop** editions are configured via GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)).
+> **👇 PROJECT STATUS**: This is a weekend/hobby project — I'm not sure I will actively develop it further. That said, it can serve as a base for your own custom images or simply be used when you need a clean Ubuntu image for your tasks on Orange Pi 4A.
 
 
 #### Why vendor kernel 5.15?
