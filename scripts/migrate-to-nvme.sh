@@ -364,8 +364,10 @@ if [[ -n "${NVME_SWAP}" ]]; then
 fi
 
 [[ -b "${NVME_PART}" ]] || err "NVMe rootfs partition ${NVME_PART} not found after partitioning"
-log "Formatting ${NVME_PART} as ext4..."
-mkfs.ext4 -L "nvme-rootfs" "${NVME_PART}"
+log "Formatting ${NVME_PART} as ext4 (U-Boot compatible)..."
+# Disable metadata_csum / orphan_file so vendor U-Boot 2018.05 ext4 driver can read /boot reliably
+mkfs.ext4 -L "nvme-rootfs" -O ^metadata_csum,^metadata_csum_seed,^orphan_file "${NVME_PART}" 2>/dev/null || \
+    mkfs.ext4 -L "nvme-rootfs" -O ^metadata_csum "${NVME_PART}"
 
 if [[ -n "${NVME_HOME}" ]]; then
     [[ -b "${NVME_HOME}" ]] || err "NVMe home partition ${NVME_HOME} not found after partitioning"
@@ -451,6 +453,7 @@ log "NVMe PARTUUID: ${NVME_PARTUUID}"
         SWAP_UUID=$(blkid -s UUID -o value "${NVME_SWAP}")
         echo "UUID=${SWAP_UUID}  none  swap  sw  0  0"
     fi
+    echo "tmpfs  /tmp  tmpfs  defaults,nosuid  0  0"
 } > "${MNT}/etc/fstab"
 
 # Update orangepiEnv.txt on NVMe — point root to NVMe

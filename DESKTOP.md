@@ -22,7 +22,7 @@ doesn't have to reinvent any of the tricky bits:
 | Xorg `modesetting` config for `sunxi-drm` | `/etc/X11/xorg.conf.d/10-modesetting.conf` | Without this Xorg dies with *"Cannot run in framebuffer mode"* on the Allwinner DRM driver. Needed for SDDM / LightDM / GDM X11 greeters. |
 | `Xwrapper.config` | `/etc/X11/Xwrapper.config` | `allowed_users=anybody` — lets DMs spawn X as the logged-in user. |
 | GPU (Mali G57 MC1) via Panfrost | built into vendor kernel 5.15 | `/dev/dri/card0` + `/dev/dri/renderD128` present out of the box, Mesa Panfrost from Ubuntu provides OpenGL ES 3.1 — enough for GNOME Shell and Plasma. |
-| User groups (cloud-init default) | `video, audio, plugdev, dialout, input` | DRM/input access for Wayland sessions. |
+| User groups (cloud-init default) | `video, render, audio, plugdev, dialout, input` | DRM/renderD128/input access for X11 and Wayland sessions. |
 
 ---
 
@@ -183,9 +183,9 @@ Result: Chromium's `V4L2VideoDecoder`/`VaapiVideoDecoder` features have nothing 
 | H.264 1080p60 / VP9 / AV1 | ❌ unplayable | >80 % dropped frames |
 | HEVC / 4K | ❌ | Don't try |
 
-If you really need hardware decode, there is an **opt-in** helper script `install-vpu` that
+If you want to experiment with the proprietary CedarX userspace libraries or `gst-omx`, there is an **opt-in** helper script `install-vpu` that
 pulls the vendor CedarX userspace blobs into `/opt/cedarx` without touching the rest of the
-system. The base image stays 100 % blob-free — nothing is downloaded at build time.
+system (note: stock Kodi 20 from Ubuntu does not load `libcedarc.so` directly without an out-of-tree plugin or GStreamer OMX pipeline — see *Kodi → Video decode* below). The base image stays 100 % blob-free — nothing is downloaded at build time.
 
 ```bash
 # Non-interactive (safe for SSH / automation):

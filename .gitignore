@@ -1,3 +1,6 @@
 .cache/
 output/
 tmp/
+.junie/
+__pycache__/
+*.pyc

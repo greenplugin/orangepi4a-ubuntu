@@ -11,14 +11,17 @@ REPO=/repo
 EXTER=${REPO}/external
 BOARD=${BOARD:-orangepi4a}
 RELEASE=${RELEASE:-noble}
+BUILD_DESKTOP=${BUILD_DESKTOP:-true}
+DESKTOP_FLAVOR=${DESKTOP_FLAVOR:-gnome}
 BOARDFAMILY="sun55iw3"
 
 KERNEL_DIR=/build/kernel
 UBOOT_DIR=/build/uboot
 ROOTFS_CACHE=/build/rootfs-cache
+ROOTFS_DESKTOP_CACHE=/build/rootfs-desktop-cache
 OUTPUT=/build/output
 
-IMAGE_SIZE_MB=4096
+MIN_IMAGE_SIZE_MB=4096
 
 log() { echo -e "\n\033[1;32m>>> $*\033[0m\n"; }
 err() { echo -e "\n\033[1;31m!!! $*\033[0m\n"; exit 1; }
@@ -120,18 +123,28 @@ pack_uboot() {
 }
 
 # =============================================================================
-# Create SD card image
+# Create SD card image from a given rootfs directory
 # =============================================================================
 create_image() {
-    log "Creating SD card image"
-
-    local img="${OUTPUT}/ubuntu-${RELEASE}-${BOARD}.img"
-    local rootfs="${ROOTFS_CACHE}/rootfs"
+    local rootfs="$1"
+    local img="$2"
+    local label="$3"
     local uboot_pack="${UBOOT_DIR}/pack"
 
+    log "Creating SD card image (${label}): ${img}"
+
+    # Calculate required image size dynamically (rootfs size + 768MB headroom, min 4096MB)
+    local rootfs_mb img_size_mb
+    rootfs_mb=$(du -sm "${rootfs}" | cut -f1)
+    img_size_mb=$(( ((rootfs_mb + 768 + 255) / 256) * 256 ))
+    if [[ ${img_size_mb} -lt ${MIN_IMAGE_SIZE_MB} ]]; then
+        img_size_mb=${MIN_IMAGE_SIZE_MB}
+    fi
+
     # Create empty image
-    log "Creating ${IMAGE_SIZE_MB}MB image..."
-    dd if=/dev/zero of="${img}" bs=1M count=${IMAGE_SIZE_MB} status=progress
+    log "Rootfs size: ${rootfs_mb}MB -> allocating ${img_size_mb}MB image..."
+    rm -f "${img}"
+    dd if=/dev/zero of="${img}" bs=1M count=${img_size_mb} status=progress
 
     # Partition: single ext4 partition starting at 20MB offset (for u-boot)
     parted -s "${img}" mklabel msdos
@@ -140,7 +153,7 @@ create_image() {
     # Setup loop device
     local loop
     loop=$(losetup --show -fP "${img}")
-    trap "kpartx -d '${loop}' 2>/dev/null; losetup -d '${loop}' 2>/dev/null; umount /build/mnt 2>/dev/null" EXIT
+    trap "umount /build/mnt 2>/dev/null || true; kpartx -d '${loop}' 2>/dev/null || true; losetup -d '${loop}' 2>/dev/null || true" EXIT
     local part="${loop}p1"
 
     # Wait for partition device
@@ -167,7 +180,7 @@ create_image() {
     mkdir -p "${mnt}"
     mount "${part}" "${mnt}"
 
-    log "Copying rootfs to image..."
+    log "Copying ${label} rootfs to image..."
     cp -a "${rootfs}/." "${mnt}/"
 
     # Update fstab with actual UUID
@@ -188,36 +201,51 @@ create_image() {
     trap - EXIT
 
     # Write U-Boot
-    log "Writing U-Boot to image..."
+    log "Writing U-Boot to ${img}..."
     dd if="${uboot_pack}/boot0_sdcard.fex" of="${img}" bs=8k seek=1 conv=fsync,notrunc
     dd if="${uboot_pack}/boot_package.fex" of="${img}" bs=8k seek=2050 conv=fsync,notrunc
 
     log "Image created: ${img}"
-    ls -lh "${OUTPUT}/"
 }
 
 # =============================================================================
 # Main
 # =============================================================================
 log "Starting x86 packing stage for Orange Pi 4A"
-log "Board: ${BOARD}, Release: ${RELEASE}"
+log "Board: ${BOARD}, Release: ${RELEASE}, Build desktop: ${BUILD_DESKTOP} (${DESKTOP_FLAVOR})"
 
 verify_artifacts
 pack_uboot
 
 # Copy bootloader files into rootfs for NVMe migration script
 install_uboot_to_rootfs() {
-    log "Installing U-Boot files into rootfs for NVMe migration..."
+    local rootfs="$1"
+    log "Installing U-Boot files into ${rootfs} for NVMe migration..."
     local uboot_pack="${UBOOT_DIR}/pack"
-    local rootfs="${ROOTFS_CACHE}/rootfs"
     local dest="${rootfs}/usr/lib/linux-u-boot"
     mkdir -p "${dest}"
     cp "${uboot_pack}/boot0_spinor.fex" "${dest}/"
     cp "${uboot_pack}/boot_package.fex" "${dest}/"
     log "Bootloader files installed to ${dest}"
 }
-install_uboot_to_rootfs
 
-create_image
+# 1. Server image
+install_uboot_to_rootfs "${ROOTFS_CACHE}/rootfs"
+SERVER_IMG="${OUTPUT}/ubuntu-${RELEASE}-${BOARD}-server.img"
+create_image "${ROOTFS_CACHE}/rootfs" "${SERVER_IMG}" "server"
+ln -sf "$(basename "${SERVER_IMG}")" "${OUTPUT}/ubuntu-${RELEASE}-${BOARD}.img"
 
-log "Packing complete! Image: ${OUTPUT}/ubuntu-${RELEASE}-${BOARD}.img"
+# 2. Desktop image (if built)
+if [[ "${BUILD_DESKTOP}" == "true" || "${BUILD_DESKTOP}" == "1" || "${BUILD_DESKTOP}" == "yes" ]]; then
+    if [[ -f "${ROOTFS_DESKTOP_CACHE}/.rootfs_desktop_done" && -d "${ROOTFS_DESKTOP_CACHE}/rootfs/bin" ]]; then
+        install_uboot_to_rootfs "${ROOTFS_DESKTOP_CACHE}/rootfs"
+        DESKTOP_IMG="${OUTPUT}/ubuntu-${RELEASE}-${BOARD}-desktop-${DESKTOP_FLAVOR}.img"
+        create_image "${ROOTFS_DESKTOP_CACHE}/rootfs" "${DESKTOP_IMG}" "desktop-${DESKTOP_FLAVOR}"
+        ln -sf "$(basename "${DESKTOP_IMG}")" "${OUTPUT}/ubuntu-${RELEASE}-${BOARD}-desktop.img"
+    else
+        err "BUILD_DESKTOP=${BUILD_DESKTOP}, but desktop rootfs was not built in ${ROOTFS_DESKTOP_CACHE}."
+    fi
+fi
+
+ls -lh "${OUTPUT}/"
+log "Packing complete!"

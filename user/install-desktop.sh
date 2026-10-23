@@ -40,10 +40,14 @@ err()  { echo -e "\033[1;31m!!! $*\033[0m" >&2; exit 1; }
 
 usage() {
     cat <<EOF
-Usage: sudo $SCRIPT_NAME <ENVIRONMENT>
+Usage: sudo $SCRIPT_NAME <ENVIRONMENT> [--autologin]
 
 Install a desktop environment on Orange Pi 4A.
 GPU acceleration uses Panfrost (Mali G57) via Mesa.
+
+Options:
+  --autologin   Enable automatic login for the default user in GDM/SDDM/LightDM
+                (labwc/sway/weston/kodi always auto-start on tty1 as the default user).
 
 Lightweight Wayland compositors (minimal, no display manager):
   labwc       Stacking Wayland compositor (openbox-like)
@@ -72,16 +76,20 @@ EOF
 # =============================================================================
 # Checks
 # =============================================================================
-[[ $# -lt 1 ]] && usage
-[[ "$1" == "--help" || "$1" == "-h" ]] && usage
+DE=""
+AUTOLOGIN="${AUTOLOGIN:-0}"
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h) usage ;;
+        --autologin) AUTOLOGIN=1 ;;
+        labwc|sway|weston|gnome|kde|xfce|kodi) DE="$arg" ;;
+        *) err "Unknown argument: $arg. Run '$SCRIPT_NAME --help' for options." ;;
+    esac
+done
+
+[[ -z "$DE" ]] && usage
 [[ $EUID -ne 0 ]] && err "This script must be run as root (sudo $SCRIPT_NAME $*)"
-
-DE="$1"
-
-case "$DE" in
-    labwc|sway|weston|gnome|kde|xfce|kodi) ;;
-    *) err "Unknown environment: $DE. Run '$SCRIPT_NAME --help' for options." ;;
-esac
 
 # =============================================================================
 # Pre-flight diagnostics — black-screen-on-DE is the most common problem
@@ -89,6 +97,13 @@ esac
 # =============================================================================
 preflight_checks() {
     log "Pre-flight diagnostics"
+
+    # When running inside a chroot during image build, hardware DRM/HDMI nodes
+    # are not present on the build host — skip live hardware checks.
+    if [[ ! -d /run/systemd/system ]]; then
+        log "Running in chroot (image build mode) — skipping live DRM/HDMI checks"
+        return 0
+    fi
 
     if [[ ! -e /dev/dri/card0 ]]; then
         err "No DRM device (/dev/dri/card0). Kernel/DTB problem — DE will not start."
@@ -171,7 +186,7 @@ remove_existing_compositor_services() {
     done
     # Old kodi-compositor drop-in dir (install-vpu put LD_LIBRARY_PATH there)
     rm -rf /etc/systemd/system/kodi-compositor.service.d 2>/dev/null || true
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null || true
 }
 
 # Disable any active display manager (so DEs/compositors don't fight on switch)
@@ -189,20 +204,75 @@ disable_active_display_managers() {
 # =============================================================================
 # Common Wayland + Mesa base (used by all lightweight compositors)
 # =============================================================================
+resolve_target_user() {
+    local candidate=""
+    # 1. Explicit SUDO_USER if invoked via sudo by a non-root user
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && id "${SUDO_USER}" &>/dev/null; then
+        echo "${SUDO_USER}"
+        return 0
+    fi
+    # 2. Build-time configured DEFAULT_USER (/etc/default/orangepi-user)
+    if [[ -f /etc/default/orangepi-user ]]; then
+        candidate=$(awk -F= '/^DEFAULT_USER=/ {gsub(/["'\'']/, "", $2); print $2}' /etc/default/orangepi-user)
+        if [[ -n "${candidate}" && "${candidate}" != "root" ]] && id "${candidate}" &>/dev/null; then
+            echo "${candidate}"
+            return 0
+        fi
+    fi
+    # 3. Cloud-init default_user in /etc/cloud/cloud.cfg.d/99-orangepi.cfg
+    if [[ -f /etc/cloud/cloud.cfg.d/99-orangepi.cfg ]]; then
+        candidate=$(awk '/default_user:/,/^[^ ]/ {if ($1 == "name:") {print $2; exit}}' /etc/cloud/cloud.cfg.d/99-orangepi.cfg)
+        if [[ -n "${candidate}" && "${candidate}" != "root" ]] && id "${candidate}" &>/dev/null; then
+            echo "${candidate}"
+            return 0
+        fi
+    fi
+    # 4. First regular user (UID 1000..65533)
+    candidate=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $1; exit}')
+    if [[ -n "${candidate}" ]]; then
+        echo "${candidate}"
+        return 0
+    fi
+    echo ""
+}
+
+ensure_user_gpu_groups() {
+    local u target
+    target=$(resolve_target_user)
+    if [[ -n "$target" ]]; then
+        usermod -aG video,render,input,audio,tty "$target" 2>/dev/null || true
+    fi
+    for u in $(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $1}'); do
+        usermod -aG video,render,input,audio,tty "$u" 2>/dev/null || true
+    done
+}
+
+ensure_panfrost_env() {
+    sed -i '/^PAN_MESA_DEBUG=/d;   /^MUTTER_DEBUG_/d; /^MESA_LOADER_DRIVER_OVERRIDE=/d' /etc/environment 2>/dev/null || true
+    cat >> /etc/environment <<'PANENV'
+PAN_MESA_DEBUG=noafbc
+PANENV
+}
+
 install_wayland_base() {
-    log "Installing Wayland base, Mesa (Panfrost), and XWayland..."
+    log "Installing Wayland base, Mesa (Panfrost), seatd, and XWayland..."
     apt-get update
     apt-get install -y --no-install-recommends \
         libgl1-mesa-dri \
+        libegl-mesa0 \
         libgles2 \
         mesa-utils \
         mesa-utils-extra \
         xwayland \
         xauth \
         dbus \
+        seatd \
         libinput-tools \
         fonts-dejavu-core \
         adwaita-icon-theme
+    systemctl enable --now seatd.service 2>/dev/null || true
+    ensure_user_gpu_groups
+    ensure_panfrost_env
 }
 
 # Mesa/GL base for full DEs (GNOME/KDE/XFCE)
@@ -248,18 +318,50 @@ create_compositor_service() {
     local name="$1"
     local exec_cmd="$2"
 
+    local comp_user comp_uid comp_home
+    comp_user=$(resolve_target_user)
+    if [[ -z "$comp_user" ]]; then
+        warn "No non-root user found — ${name} service will be created for root."
+        warn "Create a user first (cloud-init or useradd), then re-run: sudo $SCRIPT_NAME $name"
+        comp_user="root"
+        comp_uid=0
+        comp_home="/root"
+    else
+        log "${name} will run as user: $comp_user"
+        comp_uid=$(id -u "$comp_user")
+        comp_home=$(getent passwd "$comp_user" | cut -d: -f6)
+        [[ -n "$comp_home" ]] || comp_home="/home/${comp_user}"
+        usermod -aG video,render,input,audio,tty "$comp_user" 2>/dev/null || true
+    fi
+
     cat > "/etc/systemd/system/${name}-compositor.service" <<SVCEOF
 [Unit]
 Description=${name} Wayland compositor
-After=systemd-logind.service
-Wants=systemd-logind.service
+After=systemd-user-sessions.service systemd-logind.service seatd.service sound.target orangepi4a-wait-hdmi.service
+Wants=systemd-logind.service seatd.service
+Conflicts=getty@tty1.service gdm3.service sddm.service lightdm.service
 
 [Service]
 Type=simple
-User=root
-Environment=XDG_RUNTIME_DIR=/run/user/0
+User=${comp_user}
+Group=${comp_user}
+SupplementaryGroups=video render input audio tty
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=${comp_home}
+Environment=USER=${comp_user}
+Environment=XDG_RUNTIME_DIR=/run/user/${comp_uid}
 Environment=WLR_DRM_DEVICES=/dev/dri/card0
-ExecStartPre=/bin/mkdir -p /run/user/0
+Environment=PAN_MESA_DEBUG=noafbc
+ExecStartPre=+/bin/mkdir -p /run/user/${comp_uid}
+ExecStartPre=+/bin/chown ${comp_user}: /run/user/${comp_uid}
+ExecStartPre=+/bin/chmod 0700 /run/user/${comp_uid}
 ExecStart=/usr/bin/${exec_cmd}
 Restart=on-failure
 RestartSec=3
@@ -268,8 +370,15 @@ RestartSec=3
 WantedBy=graphical.target
 SVCEOF
 
-    systemctl daemon-reload
-    systemctl enable "${name}-compositor.service" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl disable getty@tty1.service 2>/dev/null || true
+    systemctl stop    getty@tty1.service 2>/dev/null || true
+    systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
+    if [[ "$name" == "sway" && "$comp_user" == "root" ]]; then
+        warn "Sway refuses to run as root; not enabling sway-compositor.service until a non-root user exists."
+    else
+        systemctl enable "${name}-compositor.service" 2>/dev/null || true
+    fi
     systemctl set-default graphical.target 2>/dev/null || true
 }
 
@@ -305,7 +414,8 @@ install_sway() {
     cat > /etc/sway/config.d/orangepi4a.conf <<'SWAYCONF'
 # Orange Pi 4A — sway config
 exec swaymsg "idle_inhibit visible"
-output HDMI-A-1 mode 1920x1200@60Hz
+# Use monitor's preferred EDID mode by default (uncomment to override):
+# output HDMI-A-1 mode 1920x1080@60Hz
 set $term foot
 SWAYCONF
 
@@ -327,6 +437,15 @@ install_weston() {
     install_weston_config "/root"
     mkdir -p /etc/skel/.config
     install_weston_config "/etc/skel"
+
+    local u u_home
+    for u in $(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $1}'); do
+        u_home=$(getent passwd "$u" | cut -d: -f6)
+        if [[ -n "$u_home" && -d "$u_home" ]]; then
+            install_weston_config "$u_home"
+            chown -R "$u:$u" "${u_home}/.config" 2>/dev/null || true
+        fi
+    done
 
     create_compositor_service "weston" "weston --backend=drm-backend.so"
 }
@@ -405,13 +524,21 @@ install_gnome() {
     # Force X11 in GDM. See long comment above — Wayland is broken on this
     # SoC/kernel combination. Users who want to experiment with Wayland can
     # pick "GNOME" (wayland) from the session menu, default is "GNOME on Xorg".
+    local dm_user autologin_gdm=""
+    dm_user=$(resolve_target_user)
+    if [[ "$AUTOLOGIN" == "1" && -n "$dm_user" ]]; then
+        log "Enabling GDM3 automatic login for user: $dm_user"
+        autologin_gdm=$'AutomaticLoginEnable=true\nAutomaticLogin='"${dm_user}"
+    fi
+
     mkdir -p /etc/gdm3
-    cat > /etc/gdm3/custom.conf <<'GDMCONF'
+    cat > /etc/gdm3/custom.conf <<GDMCONF
 [daemon]
 # sunxi-drm (T527 vendor DRM) is incompatible with Mutter's Wayland scanout
 # format selection; force X11 session by default.
 WaylandEnable=false
 DefaultSession=gnome-xorg.desktop
+${autologin_gdm}
 
 [security]
 
@@ -428,15 +555,10 @@ GDMCONF
     # software X cursor + linear Xorg FB, but cheap insurance).
     #
     # These env vars are exported via /etc/environment (read by pam_env).
-    sed -i '/^PAN_MESA_DEBUG=/d;   /^MUTTER_DEBUG_/d; /^MESA_LOADER_DRIVER_OVERRIDE=/d' /etc/environment
-    cat >> /etc/environment <<'PANENV'
-PAN_MESA_DEBUG=noafbc
-PANENV
+    ensure_panfrost_env
 
     # Ensure user is in render group (Panfrost renderD128 access)
-    for u in $(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $1}'); do
-        usermod -aG video,render,input,audio "$u" 2>/dev/null || true
-    done
+    ensure_user_gpu_groups
 
     systemctl enable gdm3.service
     systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
@@ -490,7 +612,24 @@ DefaultSession=plasma.desktop
 DEFSESS
     fi
 
+    local dm_user
+    dm_user=$(resolve_target_user)
+    if [[ "$AUTOLOGIN" == "1" && -n "$dm_user" ]]; then
+        log "Enabling SDDM automatic login for user: $dm_user"
+        cat > /etc/sddm.conf.d/30-autologin.conf <<SDDMAUTO
+[Autologin]
+User=${dm_user}
+Session=plasma.desktop
+SDDMAUTO
+    else
+        rm -f /etc/sddm.conf.d/30-autologin.conf
+    fi
+
+    ensure_panfrost_env
+    ensure_user_gpu_groups
+
     systemctl enable sddm.service
+    systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
     systemctl set-default graphical.target
 }
 
@@ -513,7 +652,25 @@ install_xfce() {
         network-manager-gnome \
         fonts-noto-core
 
+    local dm_user
+    dm_user=$(resolve_target_user)
+    mkdir -p /etc/lightdm/lightdm.conf.d
+    if [[ "$AUTOLOGIN" == "1" && -n "$dm_user" ]]; then
+        log "Enabling LightDM automatic login for user: $dm_user"
+        cat > /etc/lightdm/lightdm.conf.d/10-orangepi4a-autologin.conf <<LDMAUTO
+[Seat:*]
+autologin-user=${dm_user}
+autologin-user-timeout=0
+LDMAUTO
+    else
+        rm -f /etc/lightdm/lightdm.conf.d/10-orangepi4a-autologin.conf
+    fi
+
+    ensure_panfrost_env
+    ensure_user_gpu_groups
+
     systemctl enable lightdm.service
+    systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
     systemctl set-default graphical.target
 }
 
@@ -587,9 +744,9 @@ install_kodi() {
     # outside of a logind session (we start weston directly as a systemd unit).
     systemctl enable --now seatd.service 2>/dev/null || true
 
-    # Resolve the user that Kodi should run as (first non-root user from cloud-init)
+    # Resolve the user that Kodi should run as (SUDO_USER, DEFAULT_USER, or first non-root user)
     local kodi_user kodi_uid
-    kodi_user=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $1; exit}')
+    kodi_user=$(resolve_target_user)
     if [[ -z "$kodi_user" ]]; then
         warn "No non-root user found — Kodi service will be created but not enabled."
         warn "Create a user first (cloud-init or useradd), then re-run: sudo install-desktop kodi"
@@ -683,7 +840,7 @@ StandardError=journal
 WantedBy=graphical.target
 KODISVC
 
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null || true
     # Give tty1 to Weston (Kodi lives inside it)
     systemctl disable getty@tty1.service 2>/dev/null || true
     systemctl stop    getty@tty1.service 2>/dev/null || true

@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y \
     u-boot-tools device-tree-compiler \
     git wget curl rsync xz-utils busybox \
     uuid-runtime ca-certificates \
+    && for r in noble plucky questing resolute; do \
+         [ -e "/usr/share/debootstrap/scripts/$r" ] || ln -s gutsy "/usr/share/debootstrap/scripts/$r"; \
+       done \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build

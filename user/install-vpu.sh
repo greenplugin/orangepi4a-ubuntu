@@ -5,9 +5,10 @@
 #
 # PURPOSE
 #   Install Allwinner's proprietary userspace video decoder/encoder blobs
-#   (libcedarc + libOmx*) so that Kodi on Orange Pi 4A can do hardware
-#   H.264 / H.265 / VP9 / MPEG-2/4 / JPEG decode + H.264/H.265/JPEG encode
-#   through /dev/cedar_dev.
+#   (libcedarc + libOmx*) into /opt/cedarx (and optionally gstreamer1.0-omx)
+#   for /dev/cedar_dev hardware video decode/encode experiments.
+#   Note: stock Kodi 20 from Ubuntu noble/universe does not include a CedarX
+#   plugin and will not dlopen libcedarc without a custom plugin or gst-omx.
 #
 # WHY THIS IS A SEPARATE SCRIPT
 #   - The base image is intentionally blob-free (clean Mesa + Panfrost).
@@ -386,10 +387,10 @@ $(log "CedarX install complete.")
   Log:           $LOG_FILE
   Kodi drop-in:  $KODI_DROPIN $(test -f "$KODI_DROPIN" && echo '(active)' || echo '(not created — no Kodi)')
 
-  Verify hardware decode after next Kodi start:
-      journalctl -u kodi-client -b | grep -iE 'cedar|vpu|omx|hw.?decode'
-  In Kodi UI:
-      Settings → Player → Videos → "Allow hardware acceleration" = ON
+  Note on Kodi 20 (Ubuntu stock package):
+      Stock Kodi 20 only supports standard VAAPI/V4L2-m2m/DRM-PRIME paths and
+      does not dlopen libcedarc directly without an out-of-tree CedarX plugin
+      or GStreamer OMX pipeline (--with-gst-omx).
   To remove:
       sudo install-vpu --uninstall
 EOF

@@ -10,6 +10,11 @@ REPO=/repo
 EXTER=${REPO}/external
 BOARD=${BOARD:-orangepi4a}
 RELEASE=${RELEASE:-noble}
+DEFAULT_USER=${DEFAULT_USER:-ubuntu}
+DEFAULT_PASS=${DEFAULT_PASS:-ubuntu}
+BUILD_DESKTOP=${BUILD_DESKTOP:-true}
+DESKTOP_FLAVOR=${DESKTOP_FLAVOR:-gnome}
+DESKTOP_AUTOLOGIN=${DESKTOP_AUTOLOGIN:-1}
 ARCH=arm64
 
 KERNEL_BRANCH="orange-pi-5.15-sun55iw3"
@@ -21,6 +26,7 @@ DTB_FILE="allwinner/sun55i-t527-orangepi-4a.dtb"
 KERNEL_DIR=/build/kernel
 UBOOT_DIR=/build/uboot
 ROOTFS_CACHE=/build/rootfs-cache
+ROOTFS_DESKTOP_CACHE=/build/rootfs-desktop-cache
 DEBOOTSTRAP_CACHE=/build/debootstrap-cache
 
 # U-Boot for T527 is 32-bit ARM, needs cross-compiler even on arm64
@@ -117,7 +123,8 @@ build_uboot() {
     # Apply NVMe bounce buffer patch (fixes Data Transfer Error on large reads)
     if ! grep -q "need_bounce" drivers/nvme/nvme.c 2>/dev/null; then
         log "Applying NVMe bounce buffer patch..."
-        cp drivers/nvme/nvme.c drivers/nvme/nvme.c.pre-patch
+        [[ -f drivers/nvme/nvme.c.pre-patch ]] || cp drivers/nvme/nvme.c drivers/nvme/nvme.c.pre-patch
+        cp drivers/nvme/nvme.c.pre-patch drivers/nvme/nvme.c
         python3 "${REPO}/ubuntu/scripts/patch-nvme-bounce.py" drivers/nvme/nvme.c
         log "NVMe patch applied"
     else
@@ -126,6 +133,9 @@ build_uboot() {
 
     # Build U-Boot (32-bit ARM target, cross-compile on arm64 host)
     make ARCH=arm CROSS_COMPILE=${UBOOT_CROSS_COMPILE} sun55iw3p1_t527_defconfig
+
+    # Remove stale binaries so a failed build cannot pass verification using an old artifact
+    rm -f u-boot-nodtb.bin u-boot.bin
 
     # Build u-boot.bin only; ignore DTS compilation errors (vendor Makefile
     # tries to compile DTS using ./scripts/dtc/dtc which isn't built, and
@@ -156,44 +166,37 @@ build_uboot() {
 build_rootfs() {
     log "Stage 3: Building Ubuntu ${RELEASE} rootfs (native arm64)"
 
+    local rootfs="${ROOTFS_CACHE}/rootfs"
+
     if [[ -f "${ROOTFS_CACHE}/.rootfs_done" ]]; then
-        log "Rootfs already built, skipping"
+        log "Rootfs already built, syncing overlay configs and scripts..."
+        sync_rootfs_overlay "${rootfs}"
         return 0
     fi
 
-    local rootfs="${ROOTFS_CACHE}/rootfs"
+    # Clean any partial/interrupted rootfs state before starting fresh
+    if [[ -d "${rootfs}" ]]; then
+        umount_chroot "${rootfs}" 2>/dev/null || true
+        rm -rf "${rootfs}"
+    fi
     mkdir -p "${rootfs}"
+    mkdir -p "${DEBOOTSTRAP_CACHE}/apt-cache"
 
     # Native debootstrap — no --foreign, no qemu needed on arm64 host
-    if [[ ! -f "${DEBOOTSTRAP_CACHE}/.debootstrap_done" ]]; then
-        log "Running debootstrap (native arm64)..."
-        mkdir -p "${DEBOOTSTRAP_CACHE}/apt-cache"
-
-        debootstrap --arch=arm64 \
-            --cache-dir="${DEBOOTSTRAP_CACHE}/apt-cache" \
-            --include=systemd,systemd-sysv,dbus,sudo,openssh-server,\
+    # Package tarballs are cached in ${DEBOOTSTRAP_CACHE}/apt-cache across runs
+    log "Running debootstrap (native arm64)..."
+    debootstrap --arch=arm64 \
+        --cache-dir="${DEBOOTSTRAP_CACHE}/apt-cache" \
+        --include=systemd,systemd-sysv,dbus,sudo,openssh-server,\
 network-manager,iproute2,iputils-ping,wget,curl,nano,htop,\
 ca-certificates,locales,gnupg,udev,\
 kmod,initramfs-tools,u-boot-tools,mtd-utils,rfkill,\
 bluez,wpasupplicant,linux-firmware,netplan.io,\
-nftables,e2fsprogs,parted,fdisk,cron,cloud-init,pciutils,usbutils,alsa-utils,rsync \
-            "${RELEASE}" "${rootfs}" http://ports.ubuntu.com/
+nftables,e2fsprogs,parted,fdisk,cron,cloud-init,cloud-guest-utils,\
+pciutils,usbutils,alsa-utils,rsync \
+        "${RELEASE}" "${rootfs}" http://ports.ubuntu.com/
 
-        touch "${DEBOOTSTRAP_CACHE}/.debootstrap_done"
-    else
-        log "Debootstrap cached, restoring if needed..."
-        if [[ ! -f "${rootfs}/bin/bash" ]]; then
-            debootstrap --arch=arm64 \
-                --cache-dir="${DEBOOTSTRAP_CACHE}/apt-cache" \
-                --include=systemd,systemd-sysv,dbus,sudo,openssh-server,\
-network-manager,iproute2,iputils-ping,wget,curl,nano,htop,\
-ca-certificates,locales,gnupg,udev,\
-kmod,initramfs-tools,u-boot-tools,mtd-utils,rfkill,\
-bluez,wpasupplicant,linux-firmware,netplan.io,\
-nftables,e2fsprogs,parted,fdisk,cron,cloud-init,pciutils,usbutils,alsa-utils,rsync \
-                "${RELEASE}" "${rootfs}" http://ports.ubuntu.com/
-        fi
-    fi
+    touch "${DEBOOTSTRAP_CACHE}/.debootstrap_done"
 
     # Mount virtual filesystems for chroot
     mount_chroot "${rootfs}"
@@ -312,36 +315,37 @@ deb http://ports.ubuntu.com/ ${RELEASE}-security main restricted universe multiv
 EOF
 
     # Protect vendor kernel: prevent installation of generic Ubuntu kernel
-    # packages and DKMS modules that are incompatible with the vendor 5.15
-    # kernel and cause kernel panic (apply_relocate_add crash on module load).
-    # Users can still install desktop environments (ubuntu-desktop, xfce4, etc.)
-    # safely — only the kernel-related dependencies are blocked.
+    # packages and bootloader hooks that are incompatible with the vendor 5.15
+    # kernel and cause kernel panic or overwrite /boot/boot.scr.
     mkdir -p "${rootfs}/etc/apt/preferences.d"
     cat > "${rootfs}/etc/apt/preferences.d/99-vendor-kernel-protect.pref" <<'APTPIN'
-# Prevent installation of Ubuntu generic kernel packages.
+# Prevent installation of Ubuntu generic kernel packages and flash-kernel.
 # This board uses a vendor (Allwinner/OrangePi) kernel — generic kernel
 # images and modules are incompatible and will cause kernel panic.
+# Note: linux-firmware, linux-base, and linux-libc-dev remain allowed.
 
-# Block all generic/virtual/lowlatency kernel images
-Package: linux-image-generic linux-image-generic-hwe-* linux-image-virtual linux-image-lowlatency linux-image-unsigned-*
+# Block all Ubuntu kernel images (meta-packages and versioned linux-image-6.x-*)
+Package: linux-image-*
 Pin: release *
 Pin-Priority: -1
 
-# Block generic kernel modules (incompatible .ko files crash the vendor kernel)
-Package: linux-modules-generic linux-modules-generic-hwe-* linux-modules-extra-*
+# Block all Ubuntu kernel module packages (incompatible .ko files crash the vendor kernel)
+Package: linux-modules-*
 Pin: release *
 Pin-Priority: -1
 
-# Block kernel headers (prevent DKMS from building modules for wrong kernel)
-Package: linux-headers-generic linux-headers-generic-hwe-* linux-headers-virtual linux-headers-lowlatency
+# Block all Ubuntu kernel header packages (vendor headers are pre-installed in /usr/src)
+Package: linux-headers-*
 Pin: release *
 Pin-Priority: -1
 
-# Note: DKMS is NOT blocked — users may need it to build kernel modules
-# (e.g. wireguard, v4l2loopback) once vendor kernel headers are available.
+# Block kernel meta-packages
+Package: linux-generic* linux-virtual* linux-lowlatency* linux-raspi* linux-aws* linux-azure* linux-gcp* linux-oracle* linux-kvm*
+Pin: release *
+Pin-Priority: -1
 
-# Block linux-generic and linux-virtual meta-packages
-Package: linux-generic linux-generic-hwe-* linux-virtual linux-lowlatency
+# Block flash-kernel and distro U-Boot packages that overwrite /boot/boot.scr or U-Boot
+Package: flash-kernel u-boot-sunxi u-boot-rpi
 Pin: release *
 Pin-Priority: -1
 APTPIN
@@ -481,6 +485,73 @@ HWINIT
     # Install Docker CE from official Docker repository
     install_docker "${rootfs}"
 
+    # Sync scripts, udev rules, Xorg/HDMI configs, and cloud-init templates
+    sync_rootfs_overlay "${rootfs}"
+
+    # Enable HDMI wait service
+    chroot "${rootfs}" systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
+
+    # Prepare directory for bootloader files (populated by pack stage)
+    mkdir -p "${rootfs}/usr/lib/linux-u-boot"
+}
+
+sync_rootfs_overlay() {
+    local rootfs="$1"
+
+    # Protect vendor kernel: prevent installation of generic Ubuntu kernel
+    mkdir -p "${rootfs}/etc/apt/preferences.d"
+    cat > "${rootfs}/etc/apt/preferences.d/99-vendor-kernel-protect.pref" <<'APTPIN'
+# Prevent installation of Ubuntu generic kernel packages and flash-kernel.
+# This board uses a vendor (Allwinner/OrangePi) kernel — generic kernel
+# images and modules are incompatible and will cause kernel panic.
+# Note: linux-firmware, linux-base, and linux-libc-dev remain allowed.
+
+# Block all Ubuntu kernel images (meta-packages and versioned linux-image-6.x-*)
+Package: linux-image-*
+Pin: release *
+Pin-Priority: -1
+
+# Block all Ubuntu kernel module packages (incompatible .ko files crash the vendor kernel)
+Package: linux-modules-*
+Pin: release *
+Pin-Priority: -1
+
+# Block all Ubuntu kernel header packages (vendor headers are pre-installed in /usr/src)
+Package: linux-headers-*
+Pin: release *
+Pin-Priority: -1
+
+# Block kernel meta-packages
+Package: linux-generic* linux-virtual* linux-lowlatency* linux-raspi* linux-aws* linux-azure* linux-gcp* linux-oracle* linux-kvm*
+Pin: release *
+Pin-Priority: -1
+
+# Block flash-kernel and distro U-Boot packages that overwrite /boot/boot.scr or U-Boot
+Package: flash-kernel u-boot-sunxi u-boot-rpi
+Pin: release *
+Pin-Priority: -1
+APTPIN
+
+    # Ensure initramfs post-update hook regenerates /boot/uInitrd on apt upgrade
+    mkdir -p "${rootfs}/etc/initramfs/post-update.d"
+    cat > "${rootfs}/etc/initramfs/post-update.d/99-uboot" <<'INITRDHOOK'
+#!/bin/sh
+set -e
+if [ -n "$2" ] && [ -f "$2" ] && command -v mkimage >/dev/null 2>&1; then
+    mkimage -A arm -O linux -T ramdisk -C none -n "uInitrd" -d "$2" /boot/uInitrd >/dev/null
+fi
+INITRDHOOK
+    chmod 755 "${rootfs}/etc/initramfs/post-update.d/99-uboot"
+
+    # Udev rules for T527 hardware
+    mkdir -p "${rootfs}/etc/udev/rules.d"
+    cp "${EXTER}/packages/bsp/t527/etc/udev/rules.d/99-t527-permissions.rules" \
+        "${rootfs}/etc/udev/rules.d/"
+    cat >> "${rootfs}/etc/udev/rules.d/99-t527-permissions.rules" <<'UDEVEOF'
+KERNEL=="galcore", MODE="0666"
+KERNEL=="vipcore", MODE="0666"
+UDEVEOF
+
     # Install hardware test script
     cp "${REPO}/ubuntu/scripts/hw-test.sh" "${rootfs}/usr/local/bin/hw-test"
     chmod +x "${rootfs}/usr/local/bin/hw-test"
@@ -490,16 +561,6 @@ HWINIT
     chmod +x "${rootfs}/usr/local/bin/migrate-to-nvme"
 
     # Xorg modesetting config for sunxi-drm + Panfrost (Allwinner T527).
-    #
-    # Scanout path: /dev/dri/card0 (sunxi-drm) — linear XR24 framebuffer.
-    # GL accel:     /dev/dri/card1 (Panfrost, Mali-G57) via glamor + DRI3.
-    #
-    # Xorg auto-detects Panfrost as the GPU provider and enables glamor on it
-    # (verified: Xorg.log → "glamor X acceleration enabled on Mali-G57 (Panfrost)",
-    # glxinfo → "OpenGL renderer: Mali-G57 (Panfrost)", glmark2-es2 → ~55 FPS).
-    #
-    # Without this file Xorg tries "fbdev"/framebuffer mode on sunxi-drm and
-    # fails with "Cannot run in framebuffer mode" — SDDM/GDM X11 greeter die.
     mkdir -p "${rootfs}/etc/X11/xorg.conf.d"
     cat > "${rootfs}/etc/X11/xorg.conf.d/10-modesetting.conf" <<'XORGCONF'
 Section "Device"
@@ -524,16 +585,12 @@ XWRAP
     chmod +x "${rootfs}/usr/local/bin/install-desktop"
 
     # Install optional vendor CedarX (T527 VPU) userspace installer.
-    # Opt-in only — user must run `sudo install-vpu` explicitly to enable
-    # hardware video decode for Kodi. Base image stays blob-free.
     cp "${REPO}/ubuntu/user/install-vpu.sh" "${rootfs}/usr/local/bin/install-vpu"
     chmod +x "${rootfs}/usr/local/bin/install-vpu"
 
     # HDMI pre-warm service — vendor sunxi-drm on T527 initialises the HDMI
     # connector lazily; on cold boot /sys/class/drm/card0-HDMI-A-1/modes is
-    # empty until someone does `echo detect > .../status`. Without this the
-    # display manager starts before EDID is read and Xorg/GDM end up with no
-    # modes → blank screen. This oneshot runs before any display-manager.
+    # empty until someone does `echo detect > .../status`.
     cat > "${rootfs}/etc/systemd/system/orangepi4a-wait-hdmi.service" <<'HDMIWAIT'
 [Unit]
 Description=Orange Pi 4A HDMI connector pre-warm (force EDID read before DM)
@@ -558,13 +615,12 @@ ExecStart=/bin/bash -c '\
 [Install]
 WantedBy=graphical.target
 HDMIWAIT
-    chroot "${rootfs}" systemctl enable orangepi4a-wait-hdmi.service 2>/dev/null || true
+    mkdir -p "${rootfs}/etc/systemd/system/graphical.target.wants"
+    ln -sf /etc/systemd/system/orangepi4a-wait-hdmi.service \
+        "${rootfs}/etc/systemd/system/graphical.target.wants/orangepi4a-wait-hdmi.service"
 
     # Extra DRM/input udev rules — vendor kernel 5.15 without TMPFS_POSIX_ACL
-    # can't apply logind ACLs on devtmpfs (seen as "Failed to apply ACL:
-    # Operation not supported" during boot). Give group-based access as a
-    # fallback, so GNOME/KDE/weston can open DRM/sound/input without relying
-    # on broken ACLs.
+    # can't apply logind ACLs on devtmpfs. Give group-based access as a fallback.
     cat > "${rootfs}/etc/udev/rules.d/99-orangepi4a-drm.rules" <<'DRMRULES'
 # Orange Pi 4A — group-based access (fallback for missing devtmpfs ACL).
 KERNEL=="card[0-9]*",    SUBSYSTEM=="drm",   MODE="0660", GROUP="video",  TAG+="uaccess"
@@ -578,8 +634,27 @@ ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", \
     RUN+="/bin/sh -c 'for c in /sys/class/drm/%k-HDMI*/status; do [ -e \"$c\" ] && echo detect > \"$c\"; done'"
 DRMRULES
 
-    # Prepare directory for bootloader files (populated by pack stage)
-    mkdir -p "${rootfs}/usr/lib/linux-u-boot"
+    # Refresh cloud-init config & seed files
+    configure_cloud_init "${rootfs}"
+
+    # Ensure kernel arch Makefile/Kbuild are present in headers for DKMS
+    if [[ -d "${KERNEL_DIR}/modules/lib/modules" ]]; then
+        local kver
+        kver=$(ls "${KERNEL_DIR}/modules/lib/modules/" 2>/dev/null | head -1 || true)
+        if [[ -n "${kver}" && -d "${rootfs}/usr/src/linux-headers-${kver}" && -d "${KERNEL_DIR}/source" ]]; then
+            local hdr_dst="${rootfs}/usr/src/linux-headers-${kver}"
+            local ksrc="${KERNEL_DIR}/source"
+            [[ -f "${ksrc}/Kbuild" ]] && cp "${ksrc}/Kbuild" "${hdr_dst}/"
+            [[ -f "${ksrc}/System.map" ]] && cp "${ksrc}/System.map" "${hdr_dst}/"
+            mkdir -p "${hdr_dst}/arch/arm64"
+            [[ -f "${ksrc}/arch/arm64/Makefile" ]] && cp "${ksrc}/arch/arm64/Makefile" "${hdr_dst}/arch/arm64/"
+            [[ -f "${ksrc}/arch/arm64/Kbuild" ]] && cp "${ksrc}/arch/arm64/Kbuild" "${hdr_dst}/arch/arm64/"
+            if [[ -d "${ksrc}/arch/arm64/tools" ]]; then
+                mkdir -p "${hdr_dst}/arch/arm64/tools"
+                rsync -a "${ksrc}/arch/arm64/tools/" "${hdr_dst}/arch/arm64/tools/"
+            fi
+        fi
+    fi
 }
 
 configure_cloud_init() {
@@ -597,20 +672,49 @@ configure_cloud_init() {
     ln -sf /boot/user-data "${rootfs}/var/lib/cloud/seed/nocloud/user-data"
     ln -sf /boot/network-config "${rootfs}/var/lib/cloud/seed/nocloud/network-config"
 
-    cat > "${rootfs}/etc/cloud/cloud.cfg.d/99-orangepi.cfg" <<'CLOUDINIT'
+    # Remove legacy separate renderer file that conflicted with 99-orangepi.cfg's system_info dict
+    rm -f "${rootfs}/etc/cloud/cloud.cfg.d/99-network-renderer.cfg"
+
+    # Generate SHA-512 password hash from DEFAULT_PASS
+    local pass_hash
+    pass_hash=$(openssl passwd -6 "${DEFAULT_PASS}")
+
+    # Persist configured default username for runtime helpers (e.g. install-desktop)
+    mkdir -p "${rootfs}/etc/default"
+    cat > "${rootfs}/etc/default/orangepi-user" <<EOF
+DEFAULT_USER="${DEFAULT_USER}"
+EOF
+
+    # Pre-create the default user in rootfs so build-time desktop/autologin setup
+    # (and fallback login if cloud-init is skipped) works out of the box.
+    if ! chroot "${rootfs}" id "${DEFAULT_USER}" &>/dev/null; then
+        chroot "${rootfs}" useradd -m -s /bin/bash -G sudo,video,render,audio,plugdev,dialout,input,tty "${DEFAULT_USER}" 2>/dev/null || true
+    else
+        chroot "${rootfs}" usermod -aG sudo,video,render,audio,plugdev,dialout,input,tty "${DEFAULT_USER}" 2>/dev/null || true
+    fi
+    chroot "${rootfs}" usermod -p "${pass_hash}" "${DEFAULT_USER}" 2>/dev/null || true
+    mkdir -p "${rootfs}/etc/sudoers.d"
+    echo "${DEFAULT_USER} ALL=(ALL) NOPASSWD:ALL" > "${rootfs}/etc/sudoers.d/90-${DEFAULT_USER}"
+    chmod 0440 "${rootfs}/etc/sudoers.d/90-${DEFAULT_USER}"
+
+    cat > "${rootfs}/etc/cloud/cloud.cfg.d/99-orangepi.cfg" <<CLOUDINIT
 # Orange Pi 4A — cloud-init configuration
 # Datasource: NoCloud — seed directory with symlinks to /boot/
 datasource_list: [ NoCloud, None ]
 
-# Default user template (used if user-data doesn't specify users)
+# Default user template and network renderer (merged into single system_info block
+# so cloud-init does not overwrite network/distro keys across files).
 system_info:
+  distro: ubuntu
   default_user:
-    name: orangepi
+    name: ${DEFAULT_USER}
     lock_passwd: false
     gecos: Orange Pi User
-    groups: [sudo, video, audio, plugdev, dialout, input]
+    groups: [sudo, video, render, audio, plugdev, dialout, input]
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
+  network:
+    renderers: ['netplan']
 
 # Modules to run on first boot
 cloud_init_modules:
@@ -631,10 +735,10 @@ cloud_config_modules:
   - ntp
   - ssh_import_id
   - set_passwords
-  - package_update_upgrade_install
   - runcmd
 
 cloud_final_modules:
+  - package_update_upgrade_install
   - scripts_user
   - phone_home
   - final_message
@@ -655,8 +759,14 @@ if [ -f /var/lib/cloud/instance/boot-finished ]; then
     if [ -f /boot/network-config ]; then
         sed -i 's/password:.*/password: "REDACTED"/' /boot/network-config
     fi
+    # Also redact cached instance user-data copy if present
+    for f in /var/lib/cloud/instances/*/user-data.txt*; do
+        [ -f "$f" ] || continue
+        sed -i 's/passwd:.*/passwd: "REDACTED"/' "$f" 2>/dev/null || true
+        sed -i 's/password:.*/password: "REDACTED"/' "$f" 2>/dev/null || true
+    done
     # Disable this service after first run
-    systemctl disable cloud-init-cleanup.service 2>/dev/null
+    systemctl disable cloud-init-cleanup.service 2>/dev/null || true
 fi
 CLEANUP
     chmod +x "${rootfs}/usr/local/bin/cloud-init-cleanup"
@@ -676,24 +786,14 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 SVCUNIT
-    chroot "${rootfs}" systemctl enable cloud-init-cleanup.service 2>/dev/null || true
+    mkdir -p "${rootfs}/etc/systemd/system/multi-user.target.wants"
+    ln -sf /etc/systemd/system/cloud-init-cleanup.service \
+        "${rootfs}/etc/systemd/system/multi-user.target.wants/cloud-init-cleanup.service"
 
-    # Configure cloud-init network rendering
-    # Use netplan passthrough so WiFi (wifis:) works in network-config.
-    # Cloud-init writes /etc/netplan/50-cloud-init.yaml, netplan renders to NetworkManager.
-    # Note: cloud-init's built-in 'network-manager' renderer does NOT support wifis.
-    cat > "${rootfs}/etc/cloud/cloud.cfg.d/99-network-renderer.cfg" <<'NETCFG'
-# Let cloud-init use netplan passthrough (default on Ubuntu with netplan.io).
-# This ensures WiFi (wifis:) in /boot/network-config is properly handled.
-# Netplan will render the config to NetworkManager backend.
-system_info:
-  network:
-    renderers: ['netplan']
-NETCFG
-
-    # Install default user-data template (creates orangepi user with password "orangepi")
+    # Install default user-data template (creates ${DEFAULT_USER} user with configured password)
     # User should replace this file on SD card before first boot
-    cat > "${rootfs}/boot/user-data" <<'USERDATA'
+    mkdir -p "${rootfs}/boot"
+    cat > "${rootfs}/boot/user-data" <<USERDATA
 #cloud-config
 
 # ============================================================
@@ -708,12 +808,12 @@ NETCFG
 
 # --- User account ---
 users:
-  - name: orangepi
-    # Password: "orangepi" (change on first login!)
+  - name: ${DEFAULT_USER}
+    # Password: "${DEFAULT_PASS}" (change on first login!)
     # Generate your own: mkpasswd --method=SHA-512
-    passwd: "$6$6eGLQqae2USOKON7$OTykCLHuF5rTkuuGzh1qo.gxSl03o2mW28bqwjMoMA/fX6j8X8CEPDTVinZg8TuRCu5IrGkZoch2sVjY.XYen1"
+    passwd: "${pass_hash}"
     lock_passwd: false
-    groups: [sudo, video, audio, plugdev, dialout, input]
+    groups: [sudo, video, render, audio, plugdev, dialout, input]
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys: []
@@ -797,11 +897,13 @@ instance-id: orangepi4a-first-boot
 local-hostname: orangepi4a
 METADATA
 
-    # Enable cloud-init services
-    chroot "${rootfs}" systemctl enable cloud-init-local.service 2>/dev/null || true
-    chroot "${rootfs}" systemctl enable cloud-init.service 2>/dev/null || true
-    chroot "${rootfs}" systemctl enable cloud-config.service 2>/dev/null || true
-    chroot "${rootfs}" systemctl enable cloud-final.service 2>/dev/null || true
+    # Enable cloud-init services (only when chroot /proc is mounted)
+    if mountpoint -q "${rootfs}/proc" 2>/dev/null; then
+        chroot "${rootfs}" systemctl enable cloud-init-local.service 2>/dev/null || true
+        chroot "${rootfs}" systemctl enable cloud-init.service 2>/dev/null || true
+        chroot "${rootfs}" systemctl enable cloud-config.service 2>/dev/null || true
+        chroot "${rootfs}" systemctl enable cloud-final.service 2>/dev/null || true
+    fi
 }
 
 install_kernel() {
@@ -857,6 +959,8 @@ EOF
         cp "${ksrc}/.config" "${hdr_dst}/"
         cp "${ksrc}/Makefile" "${hdr_dst}/"
         cp "${ksrc}/Module.symvers" "${hdr_dst}/"
+        [[ -f "${ksrc}/Kbuild" ]] && cp "${ksrc}/Kbuild" "${hdr_dst}/"
+        [[ -f "${ksrc}/System.map" ]] && cp "${ksrc}/System.map" "${hdr_dst}/"
 
         # Scripts directory (build infrastructure)
         rsync -a "${ksrc}/scripts/" "${hdr_dst}/scripts/"
@@ -865,8 +969,14 @@ EOF
         rsync -a --include='*/' --include='*.h' --exclude='*' \
             "${ksrc}/include/" "${hdr_dst}/include/"
 
-        # Architecture-specific headers
+        # Architecture-specific Makefile, Kbuild, tools, and headers
         mkdir -p "${hdr_dst}/arch/arm64/include"
+        [[ -f "${ksrc}/arch/arm64/Makefile" ]] && cp "${ksrc}/arch/arm64/Makefile" "${hdr_dst}/arch/arm64/"
+        [[ -f "${ksrc}/arch/arm64/Kbuild" ]] && cp "${ksrc}/arch/arm64/Kbuild" "${hdr_dst}/arch/arm64/"
+        if [[ -d "${ksrc}/arch/arm64/tools" ]]; then
+            mkdir -p "${hdr_dst}/arch/arm64/tools"
+            rsync -a "${ksrc}/arch/arm64/tools/" "${hdr_dst}/arch/arm64/tools/"
+        fi
         rsync -a --include='*/' --include='*.h' --exclude='*' \
             "${ksrc}/arch/arm64/include/" "${hdr_dst}/arch/arm64/include/"
 
@@ -906,12 +1016,12 @@ EOF
     # Generate initrd inside chroot (native arm64, no qemu needed)
     # kver already set above
     if [[ -n "${kver}" ]]; then
-        chroot "${rootfs}" update-initramfs -c -k "${kver}" 2>/dev/null || true
+        chroot "${rootfs}" update-initramfs -u -k "${kver}" || \
+            chroot "${rootfs}" update-initramfs -c -k "${kver}"
+        [[ -f "${rootfs}/boot/initrd.img-${kver}" ]] || err "Failed to generate initrd.img-${kver}"
         # Convert to uInitrd (INITRD_ARCH=arm per vendor config)
-        if [[ -f "${rootfs}/boot/initrd.img-${kver}" ]]; then
-            mkimage -A arm -T ramdisk -C none -n "uInitrd" \
-                -d "${rootfs}/boot/initrd.img-${kver}" "${rootfs}/boot/uInitrd"
-        fi
+        mkimage -A arm -T ramdisk -C none -n "uInitrd" \
+            -d "${rootfs}/boot/initrd.img-${kver}" "${rootfs}/boot/uInitrd"
     fi
 }
 
@@ -1006,13 +1116,67 @@ NFTEOF
 }
 
 # =============================================================================
+# Stage 4: Build Desktop rootfs (optional, cloned from server rootfs)
+# =============================================================================
+build_desktop_rootfs() {
+    if [[ "${BUILD_DESKTOP}" != "true" && "${BUILD_DESKTOP}" != "1" && "${BUILD_DESKTOP}" != "yes" ]]; then
+        log "Stage 4: BUILD_DESKTOP=${BUILD_DESKTOP} — skipping desktop rootfs build"
+        return 0
+    fi
+
+    log "Stage 4: Building Ubuntu ${RELEASE} Desktop rootfs (flavor=${DESKTOP_FLAVOR}, autologin=${DESKTOP_AUTOLOGIN})"
+
+    local server_rootfs="${ROOTFS_CACHE}/rootfs"
+    local desktop_rootfs="${ROOTFS_DESKTOP_CACHE}/rootfs"
+    local stamp_file="${ROOTFS_DESKTOP_CACHE}/.rootfs_desktop_done"
+    local expected_stamp="${RELEASE}:${DESKTOP_FLAVOR}:${DESKTOP_AUTOLOGIN}:${DEFAULT_USER}"
+
+    if [[ -f "${stamp_file}" && "$(cat "${stamp_file}" 2>/dev/null)" == "${expected_stamp}" && -d "${desktop_rootfs}/bin" ]]; then
+        log "Desktop rootfs already built (${expected_stamp}), syncing overlay configs..."
+        sync_rootfs_overlay "${desktop_rootfs}"
+        return 0
+    fi
+
+    if [[ -d "${desktop_rootfs}" ]]; then
+        umount_chroot "${desktop_rootfs}" 2>/dev/null || true
+    fi
+    mkdir -p "${desktop_rootfs}"
+
+    log "Cloning server rootfs into desktop staging area..."
+    rsync -a --delete "${server_rootfs}/" "${desktop_rootfs}/"
+
+    mount_chroot "${desktop_rootfs}"
+    trap "umount_chroot '${desktop_rootfs}'" EXIT
+
+    local -a desktop_args=("${DESKTOP_FLAVOR}")
+    if [[ "${DESKTOP_AUTOLOGIN}" == "1" || "${DESKTOP_AUTOLOGIN}" == "true" || "${DESKTOP_AUTOLOGIN}" == "yes" ]]; then
+        desktop_args+=("--autologin")
+    fi
+
+    log "Running install-desktop ${desktop_args[*]} inside desktop rootfs..."
+    chroot "${desktop_rootfs}" /usr/local/bin/install-desktop "${desktop_args[@]}"
+
+    # Cleanup apt cache inside desktop rootfs
+    chroot "${desktop_rootfs}" apt-get clean
+    rm -rf "${desktop_rootfs}/var/lib/apt/lists/"*
+    rm -rf "${desktop_rootfs}/tmp/"*
+
+    umount_chroot "${desktop_rootfs}"
+    trap - EXIT
+
+    echo "${expected_stamp}" > "${stamp_file}"
+    log "Desktop rootfs build complete (${expected_stamp})"
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 log "Starting ARM64 build stage for Orange Pi 4A"
-log "Board: ${BOARD}, Release: ${RELEASE}"
+log "Board: ${BOARD}, Release: ${RELEASE}, Default user: ${DEFAULT_USER}, Build desktop: ${BUILD_DESKTOP} (${DESKTOP_FLAVOR})"
 
 build_kernel
 build_uboot
 build_rootfs
+build_desktop_rootfs
 
 log "ARM64 build stage complete! Artifacts ready for packing."

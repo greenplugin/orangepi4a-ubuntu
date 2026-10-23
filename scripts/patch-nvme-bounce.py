@@ -151,14 +151,18 @@ def patch(path):
         content = content[:match.start()] + NEW_FUNC + content[match.end():]
         changes += 1
 
-    if changes == 0:
-        print(f"ERROR: No patch points found in {path}", file=sys.stderr)
+    expected_changes = 5
+    if changes != expected_changes:
+        print(
+            f"ERROR: Expected {expected_changes} patch points in {path}, matched {changes}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     with open(path, 'w') as f:
         f.write(content)
 
-    print(f"Successfully applied {changes} fixes to {path}")
+    print(f"Successfully applied all {changes} fixes to {path}")
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:

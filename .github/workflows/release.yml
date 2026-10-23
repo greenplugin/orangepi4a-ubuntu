@@ -1,0 +1,130 @@
+name: Build & Release Orange Pi 4A Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Ubuntu release codename (noble = 24.04 LTS)'
+        required: false
+        default: 'noble'
+      desktop_flavor:
+        description: 'Desktop flavor (gnome | kde | xfce | kodi | labwc | sway | weston)'
+        required: false
+        default: 'gnome'
+      build_desktop:
+        description: 'Build Desktop image in addition to Server image'
+        type: boolean
+        required: false
+        default: true
+      tag_name:
+        description: 'Optional release tag to publish when triggered manually (e.g. v1.1.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-images:
+    name: Build Server & Desktop Images (ARM64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Free up runner disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+          df -h
+
+      - name: Sparse-checkout orangepi-build external blobs & configs
+        run: |
+          git clone --depth 1 --branch next --filter=blob:none --sparse \
+            https://github.com/orangepi-xunlong/orangepi-build.git .
+          git sparse-checkout set \
+            external/config/kernel \
+            external/config/bootscripts \
+            external/packages/bsp/t527 \
+            external/packages/blobs/bt \
+            external/packages/pack-uboot
+
+      - name: Checkout orangepi4a-ubuntu into ubuntu/
+        uses: actions/checkout@v4
+        with:
+          path: ubuntu
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ubuntu/.cache/ccache
+          key: ccache-arm64-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-arm64-${{ runner.os }}-
+
+      - name: Register QEMU binfmt for x86_64 U-Boot packing stage
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt --install amd64
+
+      - name: Build Server and Desktop images via Docker Compose
+        working-directory: ubuntu
+        env:
+          BOARD: orangepi4a
+          RELEASE: ${{ inputs.release || 'noble' }}
+          BUILD_DESKTOP: ${{ inputs.build_desktop != false && 'true' || 'false' }}
+          DESKTOP_FLAVOR: ${{ inputs.desktop_flavor || 'gnome' }}
+          DESKTOP_AUTOLOGIN: '1'
+          DEFAULT_USER: ubuntu
+          DEFAULT_PASS: ubuntu
+        run: |
+          mkdir -p output .cache/ccache
+          docker compose up --build --exit-code-from builder-pack
+
+      - name: Compress images and generate SHA256 checksums
+        working-directory: ubuntu/output
+        run: |
+          # Remove convenience symlinks before compressing real .img files
+          find . -maxdepth 1 -type l -name '*.img' -delete
+          ls -lh *.img
+
+          # Free build cache before compression to maximize disk headroom
+          sudo rm -rf ../.cache/rootfs ../.cache/rootfs-desktop ../.cache/kernel/source
+
+          for img in *.img; do
+            echo "Compressing ${img} with xz..."
+            xz -T0 -6 "${img}"
+          done
+
+          sha256sum *.img.xz | tee SHA256SUMS.txt
+          ls -lh
+
+      - name: Upload build artifacts
+        if: github.event_name == 'workflow_dispatch' && inputs.tag_name == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangepi4a-ubuntu-images
+          path: |
+            ubuntu/output/*.img.xz
+            ubuntu/output/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          generate_release_notes: false
+          body: |
+            ### Ubuntu 24.04 (Noble) for Orange Pi 4A — Server & Desktop
+
+            - Improved build system and image packaging pipeline (automated Server and Desktop builds).
+            - Default credentials: `ubuntu` / `ubuntu` (configurable via `/boot/user-data` before first boot).
+
+            > ⚠️ **Note:** This release build has not been tested on hardware yet.
+          files: |
+            ubuntu/output/*.img.xz
+            ubuntu/output/SHA256SUMS.txt

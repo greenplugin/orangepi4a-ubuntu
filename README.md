@@ -6,7 +6,7 @@
 
 > **⚠️ DISCLAIMER**: This software is provided "as is", without warranty of any kind. Use at your own risk. The authors are not responsible for any damage to hardware or data. Always back up your data before flashing.
 
-> **👇 PROJECT STATUS**: This is a weekend/hobby project — I'm not sure I will actively develop it further. That said, it can serve as a base for your own custom images or simply be used when you need a clean Ubuntu image for your tasks on Orange Pi 4A. The one thing I'll try to do soon is set up an automated build pipeline for periodic image creation, but since building the kernel and the entire system is quite resource-intensive, running it on GitLab shared runners is not really feasible.
+> **👇 PROJECT STATUS**: This is a weekend/hobby project. It can serve as a base for your own custom images or simply be used when you need a clean Ubuntu Server or Desktop image for your tasks on Orange Pi 4A. Automated image builds for both **Server** and **Desktop** editions are configured via GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)).
 
 
 #### Why vendor kernel 5.15?
@@ -81,9 +81,12 @@ mkdir -p output
 docker run --privileged --rm tonistiigi/binfmt --install all
 
 # Build (ARM stage runs first, then x86 packing stage automatically)
+# Configuration is read from .env (DEFAULT_USER=ubuntu, DEFAULT_PASS=ubuntu, BUILD_DESKTOP=true, DESKTOP_FLAVOR=gnome)
 docker compose up --build
 
-# Output: output/ubuntu-noble-orangepi4a.img
+# Outputs:
+#   output/ubuntu-noble-orangepi4a-server.img         (headless server)
+#   output/ubuntu-noble-orangepi4a-desktop-gnome.img  (desktop with Panfrost GPU acceleration & autologin)
 ```
 
 #### Run only packing stage (if ARM artifacts already cached)
@@ -109,7 +112,7 @@ users:
   - name: myuser
     passwd: "$6$..."   # mkpasswd --method=SHA-512
     lock_passwd: false
-    groups: [sudo, video, audio, plugdev, dialout, input]
+    groups: [sudo, video, render, audio, plugdev, dialout, input]
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
@@ -127,7 +130,7 @@ ssh_pwauth: true
 #   - echo "Hello" > /tmp/first-boot.txt
 ```
 
-Default: user `orangepi` with password `orangepi`. **Change before first boot!**
+Default: user `ubuntu` with password `ubuntu` (configured at build time via `DEFAULT_USER` / `DEFAULT_PASS` in [`.env`](.env)). **Change before first boot!**
 
 Generate password hash: `mkpasswd --method=SHA-512` (from `whois` package).
 
@@ -180,7 +183,7 @@ Build stages are cached in `.cache/` directory. To force rebuild:
 rm -rf .cache && docker compose up --build
 
 # Rebuild only rootfs (keep kernel/uboot)
-sudo rm -rf .cache/rootfs .cache/debootstrap && docker compose up --build
+sudo rm -rf .cache/rootfs .cache/rootfs-desktop .cache/debootstrap && docker compose up --build
 
 # Rebuild only kernel
 sudo rm -rf .cache/kernel && docker compose up
@@ -233,9 +236,9 @@ sudo dpkg -i mesa/*.deb         # GPU (OpenGL/OpenCL)
 
 > This is a hobby/weekend project. Items below are ideas, not promises — they may never be implemented.
 
-- [ ] Clean up and optimize the Docker build pipeline (reduce layers, better caching)
-- [ ] Automated periodic image builds (CI/CD pipeline — limited by build cost: kernel + rootfs compilation is expensive, hard to run on GitLab shared runners)
-- [ ] Optional Mesa/GPU userspace packages as a build flag
+- [x] Clean up and optimize the Docker build pipeline (reduce layers, better caching)
+- [x] Automated release image builds via GitHub Actions (Server + Desktop editions)
+- [x] Optional Mesa/GPU userspace packages and desktop environment as a build flag (`BUILD_DESKTOP=true`, `DESKTOP_FLAVOR=gnome`)
 - [ ] Port `orangepi-config` utility for system settings
 - [ ] Verify and improve eDP display output support (may be incomplete as-is)
 
@@ -251,7 +254,7 @@ sudo dpkg -i mesa/*.deb         # GPU (OpenGL/OpenCL)
 sudo hw-test
 ```
 
-Made together with JetBrains Junie on Claude Opus 4.6
+Made together with JetBrains Junie on Claude Opus 4.6, improved with Gemini 4 Argon
 
 #### License
 

@@ -14,12 +14,19 @@ services:
       - ./.cache/kernel:/build/kernel
       - ./.cache/uboot:/build/uboot
       - ./.cache/rootfs:/build/rootfs-cache
+      - ./.cache/rootfs-desktop:/build/rootfs-desktop-cache
       - ./.cache/debootstrap:/build/debootstrap-cache
+      - ./.cache/firmware:/build/firmware
       - ./.cache/ccache:/root/.ccache
     environment:
       - CCACHE_DIR=/root/.ccache
-      - BOARD=orangepi4a
-      - RELEASE=noble
+      - BOARD=${BOARD:-orangepi4a}
+      - RELEASE=${RELEASE:-noble}
+      - DEFAULT_USER=${DEFAULT_USER:-ubuntu}
+      - DEFAULT_PASS=${DEFAULT_PASS:-ubuntu}
+      - BUILD_DESKTOP=${BUILD_DESKTOP:-true}
+      - DESKTOP_FLAVOR=${DESKTOP_FLAVOR:-gnome}
+      - DESKTOP_AUTOLOGIN=${DESKTOP_AUTOLOGIN:-1}
     command: bash /build/build-arm.sh
 
   builder-pack:
@@ -40,9 +47,12 @@ services:
       - ./.cache/kernel:/build/kernel:ro
       - ./.cache/uboot:/build/uboot
       - ./.cache/rootfs:/build/rootfs-cache
+      - ./.cache/rootfs-desktop:/build/rootfs-desktop-cache
       # Output directory
       - ./output:/build/output
     environment:
-      - BOARD=orangepi4a
-      - RELEASE=noble
+      - BOARD=${BOARD:-orangepi4a}
+      - RELEASE=${RELEASE:-noble}
+      - BUILD_DESKTOP=${BUILD_DESKTOP:-true}
+      - DESKTOP_FLAVOR=${DESKTOP_FLAVOR:-gnome}
     command: bash /build/build-pack.sh
