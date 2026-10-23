@@ -74,14 +74,17 @@ jobs:
         env:
           BOARD: orangepi4a
           RELEASE: ${{ inputs.release || 'noble' }}
-          BUILD_DESKTOP: ${{ inputs.build_desktop != false && 'true' || 'false' }}
+          BUILD_DESKTOP: ${{ (github.event_name != 'workflow_dispatch' || inputs.build_desktop != false) && 'true' || 'false' }}
           DESKTOP_FLAVOR: ${{ inputs.desktop_flavor || 'gnome' }}
           DESKTOP_AUTOLOGIN: '1'
           DEFAULT_USER: ubuntu
           DEFAULT_PASS: ubuntu
         run: |
           mkdir -p output .cache/ccache
-          docker compose up --build --exit-code-from builder-pack
+          docker compose build builder-arm builder-pack
+          docker compose run --rm builder-arm
+          docker compose run --rm --no-deps builder-pack
+          sudo chown -R "$(id -u):$(id -g)" output .cache/ccache
 
       - name: Compress images and generate SHA256 checksums
         working-directory: ubuntu/output
